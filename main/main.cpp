@@ -1,5 +1,7 @@
 #include "camera.h"
 #include "face_detect.h"
+#include "face_tracker.h"
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "esp_lcd_panel_dev.h"
@@ -14,6 +16,7 @@
 #include "dl_image_draw.hpp"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -85,9 +88,13 @@ public:
     // 串口控制台任务：1=软自愈 2=硬自愈(复位脉冲) 3=状态 4=开关自动自愈
     xTaskCreatePinnedToCore(ConsoleTaskEntry, "console", 3072, this, 4, NULL,
                             0);
+    // 按键任务：BOOT(GPIO0) + XL9555 KEY0~KEY3 轮询去抖，切换阈值循环 /
+    // OSD 常显 / 检测开关（与串口命令互通）
+    xTaskCreatePinnedToCore(KeyTaskEntry, "keys", 3072, this, 2, NULL, 1);
     ESP_LOGI(TAG,
              "Console: 1=panel heal, 2=panel hard heal, 3=status, "
-             "4=toggle auto-heal, 5=toggle face detect, 6=cycle MSR thr");
+             "4=toggle auto-heal, 5=toggle face detect, 6=MSR thr, 7=MNP thr, "
+             "8=NMS thr");
 
     while (true) {
       vTaskDelay(pdMS_TO_TICKS(10000));
@@ -121,15 +128,23 @@ private:
   lv_obj_t *preview_image = NULL;  // 摄像头预览图像对象
   lv_obj_t *fps_label = NULL;      // 帧率覆盖层
   lv_obj_t *detect_label = NULL;   // 人脸检测信息覆盖层
+  lv_obj_t *thr_label = NULL;      // 阈值/跟踪状态 OSD（右上角）
   lv_image_dsc_t preview_dsc = {}; // 摄像头帧图像描述符（LVGL 图像源）
   uint16_t *preview_buf = NULL; // 320x240 显示缓冲（QQVGA 2 倍展开后）
+
+  // 阈值 OSD 显隐控制：dirty/常显由按键/串口任务置位，其余仅 CameraLoop 访问
+  volatile bool osd_thr_dirty = false;   // true = 需刷新 OSD 文本并弹出
+  volatile bool osd_always_show = false; // BOOT 键切换的常显开关
+  int64_t osd_show_until_us = 0;         // 自动隐藏截止时刻（仅 CameraLoop）
+  bool thr_label_shown = false;          // OSD 当前是否可见（仅 CameraLoop）
+  uint32_t capture_seq = 0;              // 采集帧序号（仅 CameraLoop）
 
   // 面板/电源守护与诊断统计
   volatile uint32_t fb_fail_count = 0;        // esp_camera_fb_get 失败次数
   volatile uint32_t heal_count = 0;           // 面板自愈执行次数
   volatile uint32_t xl9555_anomaly_count = 0; // XL9555 输出异常次数
   volatile bool auto_heal_enabled = true;     // 周期自愈开关（串口 4 号命令）
-  bool detect_enabled = true;                 // 人脸检测开关（串口 5 号命令）
+  volatile bool detect_enabled = true;        // 人脸检测开关（串口 5/KEY3 键）
   uint32_t last_fps_x10 = 0;                  // 最近一次帧率（x10）
   volatile int last_face_count = 0;           // 最近一次检测到的人脸数
   lv_mem_monitor_t lv_mem_stat = {};          // 最近一次 LVGL 池监控快照
@@ -178,14 +193,24 @@ private:
       }
       // 提交帧副本给人脸检测：仅检测空闲时拷贝，忙则丢帧保最新；
       // 检测任务独立运行于 CPU0，不影响本任务采集/渲染时序
-      face_detect_submit(fb->buf, fb->len);
+      int64_t cap_us = esp_timer_get_time();
+      capture_seq = capture_seq + 1;
+      face_detect_submit(fb->buf, fb->len, capture_seq, cap_us);
       esp_camera_fb_return(fb);
 
-      // 取最新结果并在 LVGL 锁外把绿色方框画进显示缓冲（坐标 x2 映射）
-      face_box_t boxes[FACE_DETECT_MAX_FACES];
-      int face_n = face_detect_fetch(boxes, FACE_DETECT_MAX_FACES);
-      last_face_count = face_n;
-      DrawFaceBoxes(boxes, face_n);
+      // 取最新检测结果喂给跟踪器（~25fps 纯逻辑更新），再在 LVGL 锁外
+      // 把跟踪框与其他人脸框画进显示缓冲（坐标 x2 映射）
+      face_detect_result_t det = {};
+      bool det_ok = face_detect_fetch_result(&det);
+      if (det_ok) {
+        face_tracker_update(&det, esp_timer_get_time());
+        last_face_count = det.count;
+      }
+      const face_track_out_t *trk = face_tracker_get();
+      DrawTrackTarget(trk);
+      if (det_ok) {
+        DrawOtherFaces(&det, trk);
+      }
 
       float fps = -1.0f;
       if (lvgl_port_lock(1000)) {
@@ -206,20 +231,53 @@ private:
           lv_label_set_text_fmt(fps_label, "FPS: %u.%u",
                                 (unsigned)(fps_x10 / 10),
                                 (unsigned)(fps_x10 % 10));
-          // 同时刷新检测信息覆盖层（人脸数 + 检测帧率）
+          // 同时刷新检测信息覆盖层（人脸数 + 检测帧率 + 跟踪状态）
           uint32_t det_fps_x10 = 0;
           face_detect_stats(&det_fps_x10, nullptr);
-          lv_label_set_text_fmt(detect_label, "FACE: %d | DET: %u.%u",
-                                face_n, (unsigned)(det_fps_x10 / 10),
-                                (unsigned)(det_fps_x10 % 10));
+          lv_label_set_text_fmt(detect_label, "FACE: %d | DET: %u.%u | %s",
+                                (int)last_face_count,
+                                (unsigned)(det_fps_x10 / 10),
+                                (unsigned)(det_fps_x10 % 10),
+                                detect_enabled ? TrkStateStr(trk->state)
+                                               : "OFF");
+          // OSD 可见期间周期刷新（跟踪年龄/状态持续变化）
+          if (thr_label_shown) {
+            UpdateThrLabelText();
+          }
           fps_count = 0;
           fps_window_start_us = now_us;
+        }
+
+        // OSD 显隐：dirty 弹出并显示 3s；常显优先；非常显超时自动隐藏
+        int64_t osd_now = esp_timer_get_time();
+        if (osd_thr_dirty) {
+          osd_thr_dirty = false;
+          UpdateThrLabelText();
+          lv_obj_set_hidden(thr_label, false);
+          thr_label_shown = true;
+          osd_show_until_us = osd_now + 3000000;
+        }
+        if (osd_always_show && !thr_label_shown) {
+          UpdateThrLabelText();
+          lv_obj_set_hidden(thr_label, false);
+          thr_label_shown = true;
+        }
+        if (thr_label_shown && !osd_always_show &&
+            osd_now > osd_show_until_us) {
+          lv_obj_set_hidden(thr_label, true);
+          thr_label_shown = false;
         }
         lvgl_port_unlock();
       }
 
       if (fps >= 0.0f) {
-        ESP_LOGI(TAG, "Preview FPS: %.1f", fps);
+        ESP_LOGI(TAG,
+                 "Preview FPS: %.1f TRK=%s score=%u miss=%d bbox=(%d,%d,%d,%d) "
+                 "center=(%d,%d) age=%d ms det_frame=%u",
+                 fps, TrkStateStr(trk->state), (unsigned)trk->score, trk->miss,
+                 (int)trk->x1, (int)trk->y1, (int)trk->x2, (int)trk->y2,
+                 ((int)trk->x1 + trk->x2) / 2, ((int)trk->y1 + trk->y2) / 2,
+                 trk->age_ms, (unsigned)det.frame_id);
         // 每秒让出 1 个 tick：采集+展开+渲染忙等使本任务几乎满负荷，
         // 周期性给 CPU1 空闲任务运行窗口，避免 IDLE1 饿死触发 Task WDT
         vTaskDelay(1);
@@ -227,14 +285,132 @@ private:
     }
   }
 
-  // 把检测框（160x120 坐标 ×2 映射）画成绿色空心矩形到显示缓冲。
+  // ---------------------------------------------------- 绘制辅助 / 阈值 OSD
+  // 跟踪状态枚举 -> 短字符串（日志/OSD 共用）
+  static const char *TrkStateStr(face_track_state_t st) {
+    switch (st) {
+    case FACE_TRACK_ACQUIRING:
+      return "ACQ";
+    case FACE_TRACK_TRACKING:
+      return "TRACK";
+    case FACE_TRACK_PREDICTING:
+      return "PRED";
+    default:
+      return "IDLE";
+    }
+  }
+
+  // 三级阈值循环（idx 0=MSR、1=MNP、2=NMS），档位 0.2~0.8 步进 0.1；
+  // 取当前值在档位中最接近的位置，切到下一档（三级各自独立循环）
+  void CycleThr(int idx) {
+    static const float kLadder[7] = {0.2f, 0.3f, 0.4f, 0.5f,
+                                     0.6f, 0.7f, 0.8f};
+    float msr = 0.0f, mnp = 0.0f, nms = 0.0f;
+    face_detect_get_thresholds(&msr, &mnp, &nms);
+    const float cur = (idx == 0) ? msr : ((idx == 1) ? mnp : nms);
+    int pos = 0; // 找不到精确档位时从 0 起步
+    for (int i = 0; i < 7; i++) {
+      if (std::fabs(cur - kLadder[i]) < 0.005f) {
+        pos = i;
+        break;
+      }
+    }
+    const float next = kLadder[(pos + 1) % 7];
+    if (idx == 0) {
+      face_detect_set_score_thr(0, next);
+    } else if (idx == 1) {
+      face_detect_set_score_thr(1, next);
+    } else {
+      face_detect_set_nms_thr(next);
+    }
+    face_detect_get_thresholds(&msr, &mnp, &nms); // 重新读请求值
+    ESP_LOGI(TAG, "THR: MSR=%.2f MNP=%.2f NMS=%.2f", msr, mnp, nms);
+    osd_thr_dirty = true;
+  }
+
+  // 刷新阈值 OSD 文本。只在 LVGL 锁内调用；LVGL 内建 sprintf 不支持 %f，
+  // 故阈值用整数 x100 的形式拼出两位小数
+  void UpdateThrLabelText() {
+    float msr = 0.0f, mnp = 0.0f, nms = 0.0f;
+    face_detect_get_thresholds(&msr, &mnp, &nms);
+    const face_track_out_t *trk = face_tracker_get();
+    const uint32_t m100 = (uint32_t)(msr * 100.0f + 0.5f);
+    const uint32_t mnp100 = (uint32_t)(mnp * 100.0f + 0.5f);
+    const uint32_t nms100 = (uint32_t)(nms * 100.0f + 0.5f);
+    lv_label_set_text_fmt(thr_label,
+                          "MSR %u.%02u MNP %u.%02u NMS %u.%02u\n"
+                          "TRK=%s miss=%d age=%dms",
+                          (unsigned)(m100 / 100), (unsigned)(m100 % 100),
+                          (unsigned)(mnp100 / 100), (unsigned)(mnp100 % 100),
+                          (unsigned)(nms100 / 100), (unsigned)(nms100 % 100),
+                          TrkStateStr(trk->state), (int)trk->miss,
+                          (int)trk->age_ms);
+  }
+
+  // 检测框 160x120 坐标 ×2 映射到 320x240 并夹取到显示范围；
+  // 映射后退化（x2<=x1 或 y2<=y1）返回 false
+  static bool MapBoxToScreen(int x1, int y1, int x2, int y2, int *ox1,
+                             int *oy1, int *ox2, int *oy2) {
+    x1 = x1 * 2;
+    y1 = y1 * 2;
+    x2 = x2 * 2;
+    y2 = y2 * 2;
+    // 夹取到显示范围且保证 x2>x1、y2>y1（draw_hollow_rectangle 含断言）
+    if (x1 < 0) {
+      x1 = 0;
+    }
+    if (y1 < 0) {
+      y1 = 0;
+    }
+    if (x2 > LCD_H_RES - 1) {
+      x2 = LCD_H_RES - 1;
+    }
+    if (y2 > LCD_V_RES - 1) {
+      y2 = LCD_V_RES - 1;
+    }
+    if (x2 <= x1 || y2 <= y1) {
+      return false;
+    }
+    *ox1 = x1;
+    *oy1 = y1;
+    *ox2 = x2;
+    *oy2 = y2;
+    return true;
+  }
+
+  // 画跟踪目标框：TRACKING=绿色、PREDICTING=黄色（短暂丢失外推中）。
   // 必须在 LVGL 锁外调用：本缓冲唯一写入者就是本相机任务
-  void DrawFaceBoxes(const face_box_t *boxes, int n) {
-    if (n <= 0) {
+  void DrawTrackTarget(const face_track_out_t *trk) {
+    if (trk == nullptr || !trk->valid) {
       return;
     }
-    // 绿色 RGB(0,255,0) = RGB565 0x07E0；preview_buf 为大端字节序，
-    // 故按字节序 {0x07, 0xE0}（draw_hollow_rectangle 逐字节拷贝）
+    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    if (!MapBoxToScreen(trk->x1, trk->y1, trk->x2, trk->y2, &x1, &y1, &x2,
+                        &y2)) {
+      return;
+    }
+    // 绿色 RGB(0,255,0)=0x07E0 / 黄色=0xFFE0；preview_buf 为大端字节序，
+    // 故按字节序 {高,低} 传入（draw_hollow_rectangle 逐字节拷贝）
+    std::vector<uint8_t> color = {0x07, 0xE0};
+    if (trk->state == FACE_TRACK_PREDICTING) {
+      color = {0xFF, 0xE0};
+    }
+    const dl::image::img_t img = {
+        .data = preview_buf,
+        .width = LCD_H_RES,
+        .height = LCD_V_RES,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE,
+    };
+    dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, color, 2);
+  }
+
+  // 画非跟踪目标的其余人脸：1px 绿色细框；与跟踪目标 IoU>0.5 的框跳过
+  // （已在 DrawTrackTarget 画过，避免重叠双框）。必须在 LVGL 锁外调用
+  void DrawOtherFaces(const face_detect_result_t *det,
+                      const face_track_out_t *trk) {
+    if (det == nullptr || det->count <= 0) {
+      return;
+    }
     const std::vector<uint8_t> green = {0x07, 0xE0};
     const dl::image::img_t img = {
         .data = preview_buf,
@@ -242,29 +418,41 @@ private:
         .height = LCD_V_RES,
         .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE,
     };
-    for (int i = 0; i < n; i++) {
-      int x1 = boxes[i].x1 * 2;
-      int y1 = boxes[i].y1 * 2;
-      int x2 = boxes[i].x2 * 2;
-      int y2 = boxes[i].y2 * 2;
-      // 夹取到显示范围且保证 x2>x1、y2>y1（draw_hollow_rectangle 含断言）
-      if (x1 < 0) {
-        x1 = 0;
-      }
-      if (y1 < 0) {
-        y1 = 0;
-      }
-      if (x2 > LCD_H_RES - 1) {
-        x2 = LCD_H_RES - 1;
-      }
-      if (y2 > LCD_V_RES - 1) {
-        y2 = LCD_V_RES - 1;
-      }
-      if (x2 <= x1 || y2 <= y1) {
+    for (int i = 0; i < det->count; i++) {
+      const face_box_t &b = det->boxes[i];
+      if (trk != nullptr && trk->valid &&
+          BoxIoU16(b.x1, b.y1, b.x2, b.y2, trk->x1, trk->y1, trk->x2,
+                   trk->y2) > 0.5f) {
         continue;
       }
-      dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, green, 2);
+      int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+      if (!MapBoxToScreen(b.x1, b.y1, b.x2, b.y2, &x1, &y1, &x2, &y2)) {
+        continue;
+      }
+      dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, green, 1);
     }
+  }
+
+  // 标准 IoU（交并比），坐标基准一致即可（此处为 160x120 空间）；含防除零
+  static float BoxIoU16(int16_t ax1, int16_t ay1, int16_t ax2, int16_t ay2,
+                        int16_t bx1, int16_t by1, int16_t bx2, int16_t by2) {
+    const int ix1 = (ax1 > bx1) ? ax1 : bx1;
+    const int iy1 = (ay1 > by1) ? ay1 : by1;
+    const int ix2 = (ax2 < bx2) ? ax2 : bx2;
+    const int iy2 = (ay2 < by2) ? ay2 : by2;
+    const int iw = ix2 - ix1;
+    const int ih = iy2 - iy1;
+    if (iw <= 0 || ih <= 0) {
+      return 0.0f; // 无相交
+    }
+    const float inter = (float)iw * (float)ih;
+    const float area_a = (float)(ax2 - ax1) * (float)(ay2 - ay1);
+    const float area_b = (float)(bx2 - bx1) * (float)(by2 - by1);
+    const float uni = area_a + area_b - inter;
+    if (uni <= 0.0f) {
+      return 0.0f; // 防除零
+    }
+    return inter / uni;
   }
 
   // ------------------------------------------------------------ 面板/电源守护
@@ -379,17 +567,92 @@ private:
         detect_enabled = !detect_enabled;
         face_detect_set_enabled(detect_enabled);
         break;
-      case '6': {
-        // 调试开关：循环切换 MSR 置信度阈值，观察检测帧率变化
-        static const float kMsrThr[4] = {0.5f, 0.6f, 0.7f, 0.8f};
-        static int msr_thr_idx = 0;
-        msr_thr_idx = (msr_thr_idx + 1) % 4;
-        face_detect_set_msr_thr(kMsrThr[msr_thr_idx]);
-        ESP_LOGI(TAG, "MSR thr request -> %.2f", kMsrThr[msr_thr_idx]);
+      case '6':
+        CycleThr(0); // MSR 阈值循环
         break;
-      }
+      case '7':
+        CycleThr(1); // MNP 阈值循环
+        break;
+      case '8':
+        CycleThr(2); // NMS 阈值循环
+        break;
       default:
         break;
+      }
+    }
+  }
+
+  // 按键任务入口
+  static void KeyTaskEntry(void *arg) {
+    static_cast<Application *>(arg)->KeyLoop();
+  }
+
+  // 按键扫描（20ms 周期）：BOOT(GPIO0) + XL9555 KEY0~KEY3（均低有效）。
+  // 映射：BOOT=OSD 常显开关、KEY0=MSR、KEY1=MNP、KEY2=NMS、KEY3=检测开关。
+  // 去抖：每键一个 -3..3 计数（按下 +1、松开 -1），>=3 触发并按锁存标志
+  // 防重复；松开到 <=-3 后重新武装。I2C 读失败时跳过 XL9555 4 键本 tick
+  // 的去抖更新（不伪造松开，避免假边缘），BOOT 照常处理。
+  void KeyLoop() {
+    // BOOT 键：GPIO0 上拉输入，仅轮询不加中断
+    gpio_config_t boot_cfg = {};
+    boot_cfg.pin_bit_mask = 1ULL << GPIO_NUM_0;
+    boot_cfg.mode = GPIO_MODE_INPUT;
+    boot_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    boot_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    boot_cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&boot_cfg);
+    ESP_LOGI(TAG,
+             "Keys: BOOT=OSD always-show, KEY0=MSR thr, KEY1=MNP thr, "
+             "KEY2=NMS thr, KEY3=detect on/off");
+
+    int stable[5] = {};   // 每键去抖计数，钳位在 [-3,3]
+    bool latched[5] = {}; // true = 已触发等待松开（防连发）
+    while (true) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+
+      // raw[0]=BOOT（GPIO0 低有效）；raw[1..4]=KEY0~KEY3（XL9555 输入寄存器 P1）
+      bool raw[5] = {};
+      raw[0] = (gpio_get_level(GPIO_NUM_0) == 0);
+      uint8_t p1 = 0;
+      const bool keys_ok =
+          (xl9555_read_reg(XL9555_INPUT_PORT1_REG, &p1, 1) == ESP_OK);
+      if (keys_ok) {
+        raw[1] = ((p1 >> 7) & 1) == 0; // KEY0
+        raw[2] = ((p1 >> 6) & 1) == 0; // KEY1
+        raw[3] = ((p1 >> 5) & 1) == 0; // KEY2
+        raw[4] = ((p1 >> 4) & 1) == 0; // KEY3
+      }
+
+      for (int i = 0; i < 5; i++) {
+        if (i > 0 && !keys_ok) {
+          continue; // I2C 失败：不更新 KEY0~KEY3 去抖，避免伪松动
+        }
+        if (raw[i]) {
+          if (stable[i] < 3) {
+            stable[i] = stable[i] + 1;
+          }
+        } else if (stable[i] > -3) {
+          stable[i] = stable[i] - 1;
+        }
+        if (!latched[i] && stable[i] >= 3) {
+          latched[i] = true;
+          if (i == 0) {
+            osd_always_show = !osd_always_show;
+            ESP_LOGI(TAG, "Thr OSD %s", osd_always_show ? "ON" : "OFF");
+          } else if (i == 1) {
+            CycleThr(0); // KEY0: MSR
+          } else if (i == 2) {
+            CycleThr(1); // KEY1: MNP
+          } else if (i == 3) {
+            CycleThr(2); // KEY2: NMS
+          } else {
+            // KEY3：检测开关，与串口 '5' 命令互通
+            detect_enabled = !detect_enabled;
+            face_detect_set_enabled(detect_enabled);
+          }
+        } else if (latched[i] && stable[i] <= -3) {
+          latched[i] = false; // 键已松开：重新武装
+        }
       }
     }
   }
@@ -425,6 +688,14 @@ private:
     ESP_LOGI(TAG, "STATUS detect: faces=%d det_fps=%u.%u det_drops=%" PRIu32,
              (int)last_face_count, (unsigned)(det_fps_x10 / 10),
              (unsigned)(det_fps_x10 % 10), (uint32_t)det_drops);
+    float msr = 0.0f, mnp = 0.0f, nms = 0.0f;
+    face_detect_get_thresholds(&msr, &mnp, &nms);
+    ESP_LOGI(TAG, "STATUS thr: MSR=%.2f MNP=%.2f NMS=%.2f", msr, mnp, nms);
+    const face_track_out_t *trk = face_tracker_get(); // 调试视图，允许轻微读取竞态
+    ESP_LOGI(TAG,
+             "STATUS track: state=%s score=%u miss=%d age=%dms v=(%.0f,%.0f)",
+             TrkStateStr(trk->state), (unsigned)trk->score, trk->miss,
+             trk->age_ms, trk->vx, trk->vy);
   }
 
   // ---------------------------------------------------------------- 预览 UI
@@ -478,6 +749,17 @@ private:
     lv_obj_set_style_bg_opa(detect_label, LV_OPA_50, LV_PART_MAIN);
     lv_obj_set_style_pad_all(detect_label, 4, LV_PART_MAIN);
     lv_obj_align_to(detect_label, fps_label, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
+
+    // 阈值/跟踪状态 OSD（右上角，样式与 fps_label 一致）：默认隐藏，
+    // 按键/串口触发时弹出 3s，或 BOOT 键切换为常显
+    thr_label = lv_label_create(scr);
+    lv_label_set_text(thr_label, "MSR -- MNP -- NMS --\nTRK=IDLE");
+    lv_obj_set_style_text_color(thr_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(thr_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(thr_label, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(thr_label, 4, LV_PART_MAIN);
+    lv_obj_align(thr_label, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_set_hidden(thr_label, true);
 
     lvgl_port_unlock();
   }
