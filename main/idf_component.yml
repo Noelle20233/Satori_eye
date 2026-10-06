@@ -1,0 +1,10 @@
+## IDF Component Manager Manifest File
+## 依赖由 idf.py 构建时自动从 components.espressif.com 拉取到 managed_components/
+dependencies:
+  idf: ">=5.2"
+  ## LVGL 图形库（v9 内核）
+  lvgl/lvgl: "^9.6.0"
+  ## Espressif 官方 LVGL 移植层：负责 LVGL 与 esp_lcd 的对接（tick/任务/互斥锁）
+  espressif/esp_lvgl_port: "^2.9.0"
+  ## OV2640 摄像头驱动（DVP 并行接口 + SCCB 控制总线）
+  espressif/esp32-camera: "^2.1.8"
