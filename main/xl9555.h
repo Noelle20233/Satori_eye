@@ -80,6 +80,7 @@ esp_err_t xl9555_init(void);                                            /* 初�
 int xl9555_pin_read(uint16_t pin);                                      /* 获取某个IO状态 */
 uint16_t xl9555_pin_write(uint16_t pin, int val);                       /* 控制某个IO的电平 */
 esp_err_t xl9555_read_byte(uint8_t* data, size_t len);                  /* 读取XL9555的IO值 */
+esp_err_t xl9555_read_reg(uint8_t reg, uint8_t* data, size_t len);       /* 读取XL9555任意寄存器 */
 esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len);    /* 向XL9555寄存器写入数据 */
 uint8_t xl9555_key_scan(uint8_t mode);                                  /* 扫描扩展按键 */
 void xl9555_int_init(void);                                             /* 初始化XL9555的中断引脚 */

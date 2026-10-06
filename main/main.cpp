@@ -1,5 +1,7 @@
 #include "camera.h"
+#include "face_detect.h"
 #include "driver/spi_master.h"
+#include "driver/uart.h"
 #include "esp_lcd_panel_dev.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -9,8 +11,11 @@
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 
+#include "dl_image_draw.hpp"
+
 #include <cinttypes>
 #include <cstring>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,6 +59,9 @@ public:
     InitLCD();
     InitLVGL();
     InitCamera();
+    if (face_detect_init() != ESP_OK) {
+      ESP_LOGE(TAG, "Face detect init failed.");
+    }
     CreatePreviewUI();
 
     ESP_LOGI(TAG, "Application initialized.");
@@ -69,12 +77,39 @@ public:
       abort();
     }
 
+    // 面板/电源守护任务：每 5s 重发面板初始化命令（健康面板无感），
+    // 面板被干扰进入睡眠/显示关闭/配置漂移时数秒内自动恢复；
+    // 同时校验 XL9555 配置寄存器与关键输出电平
+    xTaskCreatePinnedToCore(HealTaskEntry, "panel_heal", 3072, this, 2, NULL,
+                            0);
+    // 串口控制台任务：1=软自愈 2=硬自愈(复位脉冲) 3=状态 4=开关自动自愈
+    xTaskCreatePinnedToCore(ConsoleTaskEntry, "console", 3072, this, 4, NULL,
+                            0);
+    ESP_LOGI(TAG,
+             "Console: 1=panel heal, 2=panel hard heal, 3=status, "
+             "4=toggle auto-heal, 5=toggle face detect, 6=cycle MSR thr");
+
     while (true) {
       vTaskDelay(pdMS_TO_TICKS(10000));
+
+      if (lvgl_port_lock(200)) {
+        lv_mem_monitor(&lv_mem_stat);
+        lv_mem_valid = true;
+        lvgl_port_unlock();
+      }
+
       ESP_LOGI(TAG,
-               "Heap: internal free %" PRIu32 " B, PSRAM free %" PRIu32 " B",
+               "Heap: internal free %" PRIu32 " B, PSRAM free %" PRIu32
+               " B, fb_fail=%" PRIu32 ", heal=%" PRIu32 ", xl9555_bad=%" PRIu32,
                (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-               (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+               (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+               (uint32_t)fb_fail_count, (uint32_t)heal_count,
+               (uint32_t)xl9555_anomaly_count);
+      if (lv_mem_valid) {
+        ESP_LOGI(TAG, "LVGL mem: used %u%%, frag %u%%, free %" PRIu32 " B",
+                 lv_mem_stat.used_pct, lv_mem_stat.frag_pct,
+                 (uint32_t)lv_mem_stat.free_size);
+      }
     }
   }
 
@@ -85,8 +120,20 @@ private:
 
   lv_obj_t *preview_image = NULL;  // 摄像头预览图像对象
   lv_obj_t *fps_label = NULL;      // 帧率覆盖层
+  lv_obj_t *detect_label = NULL;   // 人脸检测信息覆盖层
   lv_image_dsc_t preview_dsc = {}; // 摄像头帧图像描述符（LVGL 图像源）
   uint16_t *preview_buf = NULL; // 320x240 显示缓冲（QQVGA 2 倍展开后）
+
+  // 面板/电源守护与诊断统计
+  volatile uint32_t fb_fail_count = 0;        // esp_camera_fb_get 失败次数
+  volatile uint32_t heal_count = 0;           // 面板自愈执行次数
+  volatile uint32_t xl9555_anomaly_count = 0; // XL9555 输出异常次数
+  volatile bool auto_heal_enabled = true;     // 周期自愈开关（串口 4 号命令）
+  bool detect_enabled = true;                 // 人脸检测开关（串口 5 号命令）
+  uint32_t last_fps_x10 = 0;                  // 最近一次帧率（x10）
+  volatile int last_face_count = 0;           // 最近一次检测到的人脸数
+  lv_mem_monitor_t lv_mem_stat = {};          // 最近一次 LVGL 池监控快照
+  bool lv_mem_valid = false;
 
   // ---------------------------------------------------------------- 摄像头
   void InitCamera() {
@@ -108,6 +155,7 @@ private:
     while (true) {
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb == NULL) {
+        fb_fail_count = fb_fail_count + 1;
         ESP_LOGE(TAG, "Camera capture failed");
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
@@ -128,7 +176,16 @@ private:
         memcpy(dst + CAMERA_H_RES * 2, dst, CAMERA_H_RES * 4);
         dst += CAMERA_H_RES * 4; // 前进两行
       }
+      // 提交帧副本给人脸检测：仅检测空闲时拷贝，忙则丢帧保最新；
+      // 检测任务独立运行于 CPU0，不影响本任务采集/渲染时序
+      face_detect_submit(fb->buf, fb->len);
       esp_camera_fb_return(fb);
+
+      // 取最新结果并在 LVGL 锁外把绿色方框画进显示缓冲（坐标 x2 映射）
+      face_box_t boxes[FACE_DETECT_MAX_FACES];
+      int face_n = face_detect_fetch(boxes, FACE_DETECT_MAX_FACES);
+      last_face_count = face_n;
+      DrawFaceBoxes(boxes, face_n);
 
       float fps = -1.0f;
       if (lvgl_port_lock(1000)) {
@@ -145,9 +202,16 @@ private:
           /* LVGL 内置 sprintf 未启用浮点支持时 %f 会输出成 "f"，
            * 改用整数拼接显示一位小数 */
           uint32_t fps_x10 = (uint32_t)(fps * 10.0f + 0.5f);
+          last_fps_x10 = fps_x10;
           lv_label_set_text_fmt(fps_label, "FPS: %u.%u",
                                 (unsigned)(fps_x10 / 10),
                                 (unsigned)(fps_x10 % 10));
+          // 同时刷新检测信息覆盖层（人脸数 + 检测帧率）
+          uint32_t det_fps_x10 = 0;
+          face_detect_stats(&det_fps_x10, nullptr);
+          lv_label_set_text_fmt(detect_label, "FACE: %d | DET: %u.%u",
+                                face_n, (unsigned)(det_fps_x10 / 10),
+                                (unsigned)(det_fps_x10 % 10));
           fps_count = 0;
           fps_window_start_us = now_us;
         }
@@ -161,6 +225,206 @@ private:
         vTaskDelay(1);
       }
     }
+  }
+
+  // 把检测框（160x120 坐标 ×2 映射）画成绿色空心矩形到显示缓冲。
+  // 必须在 LVGL 锁外调用：本缓冲唯一写入者就是本相机任务
+  void DrawFaceBoxes(const face_box_t *boxes, int n) {
+    if (n <= 0) {
+      return;
+    }
+    // 绿色 RGB(0,255,0) = RGB565 0x07E0；preview_buf 为大端字节序，
+    // 故按字节序 {0x07, 0xE0}（draw_hollow_rectangle 逐字节拷贝）
+    const std::vector<uint8_t> green = {0x07, 0xE0};
+    const dl::image::img_t img = {
+        .data = preview_buf,
+        .width = LCD_H_RES,
+        .height = LCD_V_RES,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE,
+    };
+    for (int i = 0; i < n; i++) {
+      int x1 = boxes[i].x1 * 2;
+      int y1 = boxes[i].y1 * 2;
+      int x2 = boxes[i].x2 * 2;
+      int y2 = boxes[i].y2 * 2;
+      // 夹取到显示范围且保证 x2>x1、y2>y1（draw_hollow_rectangle 含断言）
+      if (x1 < 0) {
+        x1 = 0;
+      }
+      if (y1 < 0) {
+        y1 = 0;
+      }
+      if (x2 > LCD_H_RES - 1) {
+        x2 = LCD_H_RES - 1;
+      }
+      if (y2 > LCD_V_RES - 1) {
+        y2 = LCD_V_RES - 1;
+      }
+      if (x2 <= x1 || y2 <= y1) {
+        continue;
+      }
+      dl::image::draw_hollow_rectangle(img, x1, y1, x2, y2, green, 2);
+    }
+  }
+
+  // ------------------------------------------------------------ 面板/电源守护
+  static void HealTaskEntry(void *arg) {
+    static_cast<Application *>(arg)->HealLoop();
+  }
+
+  static void ConsoleTaskEntry(void *arg) {
+    static_cast<Application *>(arg)->ConsoleLoop();
+  }
+
+  void HealLoop() {
+    ESP_LOGI(TAG, "Panel guard started (soft heal every 30s).");
+    while (true) {
+      vTaskDelay(pdMS_TO_TICKS(30000));
+      GuardXl9555();
+      if (auto_heal_enabled) {
+        PanelHeal(false);
+      }
+    }
+  }
+
+  // XL9555 守护：回读方向配置寄存器与关键输出电平（仅读，无副作用）。
+  // 芯片受扰/掉电复位会导致输出寄存器丢失或整体复位成输入态，
+  // 此时重新配置并恢复电平；I2C 瞬时读失败不当作芯片异常，避免误写。
+  void GuardXl9555() {
+    uint8_t cfg[2] = {0xFF, 0xFF};
+    esp_err_t err = xl9555_read_reg(XL9555_CONFIG_PORT0_REG, cfg, 2);
+    if (err != ESP_OK) {
+      return;
+    }
+    bool bad = (cfg[0] != 0x03 || cfg[1] != 0xF0) ||
+               (xl9555_pin_read(SLCD_PWR_IO) != 1) ||
+               (xl9555_pin_read(SLCD_RST_IO) != 1) ||
+               (xl9555_pin_read(OV_PWDN_IO) != 0) ||
+               (xl9555_pin_read(OV_RESET_IO) != 1);
+    if (bad) {
+      xl9555_anomaly_count = xl9555_anomaly_count + 1;
+      ESP_LOGW(TAG, "XL9555 anomaly #%" PRIu32 " (cfg=%02X,%02X), restoring",
+               (uint32_t)xl9555_anomaly_count, cfg[0], cfg[1]);
+      // 直接写配置寄存器 {P0=0x03,P1=0xF0}（等价 xl9555_ioconfig(0xF003)，
+      // 但不带其重试死循环，避免 I2C 永久故障时守护任务被卡死）
+      uint8_t cfg_fix[2] = {0x03, 0xF0};
+      if (xl9555_write_byte(XL9555_CONFIG_PORT0_REG, cfg_fix, 2) != ESP_OK) {
+        ESP_LOGE(TAG, "XL9555 config restore failed");
+      }
+      xl9555_pin_write(SLCD_PWR_IO, 1);
+      xl9555_pin_write(SLCD_RST_IO, 1);
+      xl9555_pin_write(OV_PWDN_IO, 0);
+      xl9555_pin_write(OV_RESET_IO, 1);
+    }
+  }
+
+  // ST7789 面板状态自愈：重发初始化命令序列（SLPOUT/MADCTL/COLMOD/RAMCTRL
+  // + 旋转 + 颜色反转 + DISPON）。所有命令幂等且不触碰 GRAM，正常状态下
+  // 无感；面板若被误置为睡眠/显示关闭/配置漂移可在周期内恢复。
+  // 注意：必须在 LVGL 锁内执行——esp_lcd 的 SPI 事务不可并发，否则
+  // acquire bus 失败会丢掉 flush 完成回调，使刷新等待永久卡死。
+  void PanelHeal(bool hard_reset) {
+    if (!lvgl_port_lock(2000)) {
+      ESP_LOGW(TAG, "PanelHeal: LVGL lock timeout, skipped");
+      return;
+    }
+    if (hard_reset) {
+      // 与 InitLCD 一致的硬件复位时序：RST 低 10ms -> 高 -> 120ms
+      xl9555_pin_write(SLCD_RST_IO, 0);
+      vTaskDelay(pdMS_TO_TICKS(10));
+      xl9555_pin_write(SLCD_RST_IO, 1);
+      vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    esp_lcd_panel_init(panel_handle);          // SLPOUT + MADCTL(含旋转位) + COLMOD + RAMCTRL
+    esp_lcd_panel_swap_xy(panel_handle, true); // 与 InitLVGL 的 rotation 配置一致
+    esp_lcd_panel_mirror(panel_handle, true, false);
+    esp_lcd_panel_invert_color(panel_handle, true);
+    esp_lcd_panel_disp_on_off(panel_handle, true);
+    heal_count = heal_count + 1;
+    lvgl_port_unlock();
+  }
+
+  // 串口控制台（UART0，与日志共用；不影响日志输出）
+  void ConsoleLoop() {
+    if (uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0) != ESP_OK) {
+      ESP_LOGE(TAG, "Console: uart driver install failed");
+      vTaskDelete(NULL);
+      return;
+    }
+    uint8_t c = 0;
+    while (true) {
+      if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(200)) != 1) {
+        continue;
+      }
+      switch (c) {
+      case '1':
+        PanelHeal(false);
+        ESP_LOGI(TAG, "Panel soft heal done (#%" PRIu32 ")",
+                 (uint32_t)heal_count);
+        break;
+      case '2':
+        PanelHeal(true);
+        ESP_LOGI(TAG, "Panel hard heal done (#%" PRIu32 ")",
+                 (uint32_t)heal_count);
+        break;
+      case '3':
+        LogStatus();
+        break;
+      case '4':
+        auto_heal_enabled = !auto_heal_enabled;
+        ESP_LOGI(TAG, "Auto heal %s", auto_heal_enabled ? "ON" : "OFF");
+        break;
+      case '5':
+        // 调试开关：暂停/恢复人脸检测（用于单变量对比实验）
+        detect_enabled = !detect_enabled;
+        face_detect_set_enabled(detect_enabled);
+        break;
+      case '6': {
+        // 调试开关：循环切换 MSR 置信度阈值，观察检测帧率变化
+        static const float kMsrThr[4] = {0.5f, 0.6f, 0.7f, 0.8f};
+        static int msr_thr_idx = 0;
+        msr_thr_idx = (msr_thr_idx + 1) % 4;
+        face_detect_set_msr_thr(kMsrThr[msr_thr_idx]);
+        ESP_LOGI(TAG, "MSR thr request -> %.2f", kMsrThr[msr_thr_idx]);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+
+  void LogStatus() {
+    ESP_LOGI(TAG,
+             "STATUS: up=%lld s fps=%u.%u fb_fail=%" PRIu32 " heal=%" PRIu32
+             " xl9555_bad=%" PRIu32,
+             esp_timer_get_time() / 1000000,
+             (unsigned)(last_fps_x10 / 10), (unsigned)(last_fps_x10 % 10),
+             (uint32_t)fb_fail_count, (uint32_t)heal_count,
+             (uint32_t)xl9555_anomaly_count);
+    ESP_LOGI(TAG, "STATUS pins: PWR=%d RST=%d PWDN=%d OVRST=%d",
+             xl9555_pin_read(SLCD_PWR_IO), xl9555_pin_read(SLCD_RST_IO),
+             xl9555_pin_read(OV_PWDN_IO), xl9555_pin_read(OV_RESET_IO));
+    if (lvgl_port_lock(500)) {
+      lv_mem_monitor(&lv_mem_stat);
+      lv_mem_valid = true;
+      lvgl_port_unlock();
+    }
+    if (lv_mem_valid) {
+      ESP_LOGI(TAG,
+               "STATUS heap: int=%" PRIu32 " B psram=%" PRIu32
+               " B lvgl_used=%u%% lvgl_frag=%u%% lvgl_free=%" PRIu32 " B",
+               (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+               lv_mem_stat.used_pct, lv_mem_stat.frag_pct,
+               (uint32_t)lv_mem_stat.free_size);
+    }
+    uint32_t det_fps_x10 = 0;
+    uint32_t det_drops = 0;
+    face_detect_stats(&det_fps_x10, &det_drops);
+    ESP_LOGI(TAG, "STATUS detect: faces=%d det_fps=%u.%u det_drops=%" PRIu32,
+             (int)last_face_count, (unsigned)(det_fps_x10 / 10),
+             (unsigned)(det_fps_x10 % 10), (uint32_t)det_drops);
   }
 
   // ---------------------------------------------------------------- 预览 UI
@@ -205,6 +469,15 @@ private:
     lv_obj_set_style_bg_opa(fps_label, LV_OPA_50, LV_PART_MAIN);
     lv_obj_set_style_pad_all(fps_label, 4, LV_PART_MAIN);
     lv_obj_align(fps_label, LV_ALIGN_TOP_LEFT, 4, 4);
+
+    // 检测信息覆盖层（FPS 标签下方）：人脸数与检测帧率，随 FPS 每秒刷新
+    detect_label = lv_label_create(scr);
+    lv_label_set_text(detect_label, "FACE: -- | DET: --");
+    lv_obj_set_style_text_color(detect_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(detect_label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(detect_label, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(detect_label, 4, LV_PART_MAIN);
+    lv_obj_align_to(detect_label, fps_label, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
 
     lvgl_port_unlock();
   }

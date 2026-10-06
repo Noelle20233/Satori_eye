@@ -38,6 +38,18 @@ esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 }
 
 /**
+ * @brief       读取XL9555任意寄存器的值（如配置寄存器，用于运行时守护校验）
+ * @param       reg:寄存器地址
+ * @param       data:读取数据的存储区
+ * @param       len:读取数据的大小
+ * @retval      ESP_OK:读取成功; 其他:读取失败
+ */
+esp_err_t xl9555_read_reg(uint8_t reg, uint8_t *data, size_t len)
+{
+    return i2c_master_transmit_receive(xl9555_handle, &reg, 1, data, len, -1);
+}
+
+/**
  * @brief       向XL9555寄存器写入数据
  * @param       reg:寄存器地址
  * @param       data:要写入数据的存储区

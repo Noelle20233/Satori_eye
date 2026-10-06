@@ -102,6 +102,7 @@ static void lvgl_port_flush_callback(lv_display_t *drv, const lv_area_t *area, u
 static void lvgl_port_disp_size_update_callback(lv_event_t *e);
 static void lvgl_port_disp_rotation_update(lvgl_port_display_ctx_t *disp_ctx);
 static void lvgl_port_display_invalidate_callback(lv_event_t *e);
+static void lvgl_port_flush_wait_callback(lv_display_t *drv);
 
 /*******************************************************************************
 * Public API functions
@@ -129,6 +130,10 @@ lv_display_t *lvgl_port_add_disp(const lvgl_port_display_cfg_t *disp_cfg)
 
         /* Apply rotation from initial display configuration */
         lvgl_port_disp_rotation_update(disp_ctx);
+
+        /* 注册传输完成等待回调：flush 等待改为阻塞让出，替代 LVGL
+         * 默认的裸忙等（避免饿死空闲任务触发 Task WDT） */
+        lv_display_set_flush_wait_cb(disp, lvgl_port_flush_wait_callback);
     }
     lvgl_port_unlock();
 
@@ -391,6 +396,13 @@ static lv_display_t *lvgl_port_add_disp_priv(const lvgl_port_display_cfg_t *disp
 
         disp_ctx->draw_buffs[0] = buf1;
         disp_ctx->draw_buffs[1] = buf2;
+
+        /* SPI 等非撕裂控制接口同样需要传输完成信号量：
+         * 配合 lvgl_port_flush_wait_callback 阻塞等待传输完成，
+         * 取代 LVGL 默认的裸忙等（忙等饿死空闲任务会触发 Task WDT） */
+        trans_sem = xSemaphoreCreateCounting(1, 0);
+        ESP_GOTO_ON_FALSE(trans_sem, ESP_ERR_NO_MEM, err, TAG, "Failed to create transport counting Semaphore");
+        disp_ctx->trans_sem = trans_sem;
     }
 
     disp = lv_display_create(disp_cfg->hres, disp_cfg->vres);
@@ -508,10 +520,20 @@ err:
 static bool lvgl_port_flush_io_ready_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata,
         void *user_ctx)
 {
+    BaseType_t need_yield = pdFALSE;
+
     lv_display_t *disp_drv = (lv_display_t *)user_ctx;
     assert(disp_drv != NULL);
     lv_disp_flush_ready(disp_drv);
-    return false;
+
+    /* 通知等待传输完成的 flush_wait 回调：先清 flushing 再 give，
+     * 保证等待方被唤醒时 flushing 已为 0 */
+    lvgl_port_display_ctx_t *disp_ctx = (lvgl_port_display_ctx_t *)lv_display_get_driver_data(disp_drv);
+    if (disp_ctx && disp_ctx->trans_sem) {
+        xSemaphoreGiveFromISR(disp_ctx->trans_sem, &need_yield);
+    }
+
+    return (need_yield == pdTRUE);
 }
 
 #if (SOC_MIPI_DSI_SUPPORTED && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0))
@@ -564,6 +586,22 @@ static LVGL_PORT_IRAM bool lvgl_port_flush_rgb_vsync_ready_callback(esp_lcd_pane
 }
 #endif
 #endif
+
+/* 传输完成等待回调：取代 LVGL 默认的裸忙等（while(disp->flushing)）。
+ * 忙等长时间独占 CPU、饿死空闲任务会触发 Task WDT；这里改为阻塞等待
+ * 传输完成信号量（等待期间主动让出 CPU）。500ms 超时兜底：极端情况下
+ * 完成回调丢失时不至于永久卡死。 */
+static void lvgl_port_flush_wait_callback(lv_display_t *drv)
+{
+    lvgl_port_display_ctx_t *disp_ctx = (lvgl_port_display_ctx_t *)lv_display_get_driver_data(drv);
+    if (disp_ctx && disp_ctx->trans_sem) {
+        /* 先清掉可能残留的完成计数，再等本次传输完成 */
+        xSemaphoreTake(disp_ctx->trans_sem, 0);
+        if (xSemaphoreTake(disp_ctx->trans_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            ESP_LOGW(TAG, "flush wait timeout");
+        }
+    }
+}
 
 static void _lvgl_port_transform_monochrome(lv_display_t *display, const lv_area_t *area, uint8_t **color_map)
 {
